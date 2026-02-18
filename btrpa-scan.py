@@ -116,7 +116,13 @@ _GUI_HTML = r"""<!DOCTYPE html>
 }
 html,body{height:100%;background:var(--bg);color:var(--text);
   font-family:'Fira Code',Consolas,'Courier New',monospace;font-size:13px;
-  overflow-x:hidden}
+  overflow-x:hidden;position:relative}
+
+/* ── matrix data rain background ─────────────────────────── */
+#matrix-bg{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
+#matrix-bg canvas{width:100%;height:100%}
+/* everything else above the rain */
+#header,#panels,#table-wrap,#tooltip,#overlay{position:relative;z-index:1}
 a{color:var(--cyan)}
 
 /* ── header bar ────────────────────────────────────────────── */
@@ -177,6 +183,9 @@ a{color:var(--cyan)}
 </style>
 </head>
 <body>
+
+<!-- matrix data rain background -->
+<div id="matrix-bg"><canvas id="matrix-canvas"></canvas></div>
 
 <!-- header -->
 <div id="header">
@@ -247,6 +256,92 @@ var sortAsc = false;
 var hoveredAddr = null;
 
 /* ================================================================
+   Matrix Data Rain Background
+   ================================================================ */
+var mCanvas = document.getElementById("matrix-canvas");
+var mCtx = mCanvas.getContext("2d");
+var matrixCols = [];
+var matrixData = []; // per-column: array of {char, alpha}
+var MATRIX_FONT_SIZE = 13;
+var matrixW = 0;
+
+function resizeMatrix(){
+  mCanvas.width  = window.innerWidth;
+  mCanvas.height = window.innerHeight;
+  matrixW = Math.floor(mCanvas.width / MATRIX_FONT_SIZE);
+  // preserve existing columns, add new ones if wider
+  while(matrixCols.length < matrixW) matrixCols.push(Math.random()*mCanvas.height);
+  while(matrixData.length < matrixW) matrixData.push([]);
+}
+window.addEventListener("resize", resizeMatrix);
+resizeMatrix();
+
+// pool of data strings to rain — updated with real device data
+var matrixPool = [
+  "FF:E1:A0:3B:9C:22","0x004C","RSSI:-45","2.4GHz","BLE5.0","SCAN","RPA",
+  "0xFEED","AES128","IRK","GATT","L2CAP","ADV_IND","CONNECT",
+  "CH37","CH38","CH39","iBeacon","UUID","GAP","SMP",
+];
+
+function feedMatrixPool(){
+  // inject real MAC addresses and data from discovered devices
+  var addrs = Object.keys(devices);
+  for(var i=0;i<addrs.length;i++){
+    var d = devices[addrs[i]];
+    if(matrixPool.indexOf(d.address)===-1) matrixPool.push(d.address);
+    if(d.rssi!=null){
+      var rStr = "RSSI:"+d.rssi;
+      if(matrixPool.indexOf(rStr)===-1) matrixPool.push(rStr);
+    }
+    if(d.name && d.name!=="Unknown" && matrixPool.indexOf(d.name)===-1){
+      matrixPool.push(d.name);
+    }
+    if(d.manufacturer_data && matrixPool.indexOf(d.manufacturer_data)===-1){
+      matrixPool.push(d.manufacturer_data.substring(0,16));
+    }
+  }
+}
+
+function getMatrixChar(col){
+  // pick a character from the pool or random hex
+  if(Math.random()<0.3){
+    var s = matrixPool[Math.floor(Math.random()*matrixPool.length)];
+    var ci = Math.floor(Math.random()*s.length);
+    return s[ci];
+  }
+  return "0123456789ABCDEF"[Math.floor(Math.random()*16)];
+}
+
+function drawMatrix(){
+  // darken previous frame
+  mCtx.fillStyle = "rgba(10,10,10,0.06)";
+  mCtx.fillRect(0,0,mCanvas.width,mCanvas.height);
+  mCtx.font = MATRIX_FONT_SIZE+"px monospace";
+  for(var i=0;i<matrixW;i++){
+    var x = i * MATRIX_FONT_SIZE;
+    var y = matrixCols[i];
+    var ch = getMatrixChar(i);
+    // head character brighter
+    mCtx.fillStyle = "rgba(0,255,65,0.25)";
+    mCtx.fillText(ch, x, y);
+    // trail character dimmer
+    if(y > MATRIX_FONT_SIZE){
+      mCtx.fillStyle = "rgba(0,255,65,0.06)";
+      mCtx.fillText(ch, x, y - MATRIX_FONT_SIZE);
+    }
+    matrixCols[i] += MATRIX_FONT_SIZE;
+    // reset column randomly or when off screen
+    if(matrixCols[i] > mCanvas.height && Math.random()>0.975){
+      matrixCols[i] = 0;
+    }
+  }
+}
+// update matrix pool every 5s with real device data
+setInterval(feedMatrixPool, 5000);
+// run matrix at ~20fps (independent of radar)
+setInterval(drawMatrix, 50);
+
+/* ================================================================
    Radar
    ================================================================ */
 var rCanvas = document.getElementById("radar-canvas");
@@ -255,6 +350,7 @@ var sweepAngle = 0;
 var SWEEP_PERIOD = 4000; // ms per revolution
 var RINGS = [1, 5, 10, 20]; // metres
 var MAX_RING = 20;
+var pingRipples = []; // {cx,cy,r,maxR,alpha,color,born}
 
 function resizeCanvas(){
   var wrap = document.getElementById("radar-wrap");
@@ -274,7 +370,6 @@ function hashAddr(addr){
 
 function distToRadius(d, maxR){
   if(d==null||d===""||d<=0) return maxR*0.85;
-  // log scale: 0m->0, 1m->ring1, 20m->maxR
   var clamped = Math.min(d, MAX_RING);
   return (Math.log(clamped+1)/Math.log(MAX_RING+1))*maxR;
 }
@@ -286,6 +381,11 @@ function dotColor(d){
   return "#ff4444";
 }
 
+function hexToRgba(hex, a){
+  var r=parseInt(hex.slice(1,3),16), g=parseInt(hex.slice(3,5),16), b=parseInt(hex.slice(5,7),16);
+  return "rgba("+r+","+g+","+b+","+a+")";
+}
+
 function drawRadar(ts){
   var dpr = window.devicePixelRatio||1;
   var W = rCanvas.width, H = rCanvas.height;
@@ -294,52 +394,135 @@ function drawRadar(ts){
 
   rCtx.clearRect(0,0,W,H);
 
-  // rings
+  // ── subtle grid lines (crosshair) ──
+  rCtx.strokeStyle = "rgba(0,255,65,0.06)";
+  rCtx.lineWidth = 1*dpr;
+  rCtx.beginPath(); rCtx.moveTo(cx,cy-maxR); rCtx.lineTo(cx,cy+maxR); rCtx.stroke();
+  rCtx.beginPath(); rCtx.moveTo(cx-maxR,cy); rCtx.lineTo(cx+maxR,cy); rCtx.stroke();
+  // diagonal crosshairs
+  var d45 = maxR*0.707;
+  rCtx.beginPath(); rCtx.moveTo(cx-d45,cy-d45); rCtx.lineTo(cx+d45,cy+d45); rCtx.stroke();
+  rCtx.beginPath(); rCtx.moveTo(cx+d45,cy-d45); rCtx.lineTo(cx-d45,cy+d45); rCtx.stroke();
+
+  // ── distance rings with glow ──
   for(var ri=0;ri<RINGS.length;ri++){
     var r = (Math.log(RINGS[ri]+1)/Math.log(MAX_RING+1))*maxR;
+    // outer glow
     rCtx.beginPath();
     rCtx.arc(cx,cy,r,0,Math.PI*2);
-    rCtx.strokeStyle = "rgba(0,255,65,0.15)";
+    rCtx.strokeStyle = "rgba(0,255,65,0.08)";
+    rCtx.lineWidth = 3*dpr;
+    rCtx.stroke();
+    // crisp ring
+    rCtx.beginPath();
+    rCtx.arc(cx,cy,r,0,Math.PI*2);
+    rCtx.strokeStyle = "rgba(0,255,65,0.2)";
     rCtx.lineWidth = 1*dpr;
     rCtx.stroke();
-    rCtx.fillStyle = "rgba(0,255,65,0.35)";
+    // labels at top and right
+    rCtx.fillStyle = "rgba(0,255,65,0.45)";
     rCtx.font = (10*dpr)+"px monospace";
     rCtx.fillText(RINGS[ri]+"m", cx+r+4*dpr, cy-4*dpr);
+    rCtx.fillText(RINGS[ri]+"m", cx+4*dpr, cy-r-4*dpr);
   }
 
-  // sweep
-  sweepAngle = ((ts % SWEEP_PERIOD)/SWEEP_PERIOD)*Math.PI*2;
-  // trail gradient
-  var trailLen = Math.PI*0.4;
-  var grad = rCtx.createConicGradient(sweepAngle - trailLen, cx, cy);
-  grad.addColorStop(0, "rgba(0,255,65,0)");
-  grad.addColorStop(0.8, "rgba(0,255,65,0.07)");
-  grad.addColorStop(1, "rgba(0,255,65,0.18)");
-  rCtx.beginPath();
-  rCtx.moveTo(cx,cy);
-  rCtx.arc(cx,cy,maxR, sweepAngle-trailLen, sweepAngle);
-  rCtx.closePath();
-  rCtx.fillStyle = grad;
-  rCtx.fill();
+  // ── outer ring decorative tick marks ──
+  rCtx.strokeStyle = "rgba(0,255,65,0.15)";
+  rCtx.lineWidth = 1*dpr;
+  for(var deg=0; deg<360; deg+=10){
+    var a = deg*Math.PI/180;
+    var inner = deg%30===0 ? maxR*0.92 : maxR*0.96;
+    rCtx.beginPath();
+    rCtx.moveTo(cx+Math.cos(a)*inner, cy+Math.sin(a)*inner);
+    rCtx.lineTo(cx+Math.cos(a)*maxR, cy+Math.sin(a)*maxR);
+    rCtx.stroke();
+  }
+  // degree labels at 30° intervals
+  rCtx.fillStyle = "rgba(0,255,65,0.2)";
+  rCtx.font = (8*dpr)+"px monospace";
+  for(var deg2=0; deg2<360; deg2+=30){
+    var a2 = deg2*Math.PI/180;
+    var lx = cx+Math.cos(a2)*(maxR+12*dpr);
+    var ly = cy+Math.sin(a2)*(maxR+12*dpr);
+    rCtx.fillText(deg2+"\u00B0", lx-10*dpr, ly+4*dpr);
+  }
 
-  // sweep line
-  rCtx.beginPath();
-  rCtx.moveTo(cx,cy);
-  rCtx.lineTo(cx+Math.cos(sweepAngle)*maxR, cy+Math.sin(sweepAngle)*maxR);
-  rCtx.strokeStyle = "rgba(0,255,65,0.7)";
+  // ── sweep with multi-layer trail ──
+  sweepAngle = ((ts % SWEEP_PERIOD)/SWEEP_PERIOD)*Math.PI*2;
+  // wide dim trail
+  var trailLen1 = Math.PI*0.6;
+  var grad1 = rCtx.createConicGradient(sweepAngle - trailLen1, cx, cy);
+  grad1.addColorStop(0, "rgba(0,255,65,0)");
+  grad1.addColorStop(0.7, "rgba(0,255,65,0.03)");
+  grad1.addColorStop(1, "rgba(0,255,65,0.08)");
+  rCtx.beginPath(); rCtx.moveTo(cx,cy);
+  rCtx.arc(cx,cy,maxR, sweepAngle-trailLen1, sweepAngle);
+  rCtx.closePath(); rCtx.fillStyle = grad1; rCtx.fill();
+  // narrow bright trail
+  var trailLen2 = Math.PI*0.25;
+  var grad2 = rCtx.createConicGradient(sweepAngle - trailLen2, cx, cy);
+  grad2.addColorStop(0, "rgba(0,255,65,0)");
+  grad2.addColorStop(0.5, "rgba(0,255,65,0.06)");
+  grad2.addColorStop(1, "rgba(0,255,65,0.22)");
+  rCtx.beginPath(); rCtx.moveTo(cx,cy);
+  rCtx.arc(cx,cy,maxR, sweepAngle-trailLen2, sweepAngle);
+  rCtx.closePath(); rCtx.fillStyle = grad2; rCtx.fill();
+
+  // ── sweep line with glow ──
+  var sx = cx+Math.cos(sweepAngle)*maxR, sy = cy+Math.sin(sweepAngle)*maxR;
+  // glow layer
+  rCtx.beginPath(); rCtx.moveTo(cx,cy); rCtx.lineTo(sx,sy);
+  rCtx.strokeStyle = "rgba(0,255,65,0.25)";
+  rCtx.lineWidth = 6*dpr;
+  rCtx.stroke();
+  // main line
+  rCtx.beginPath(); rCtx.moveTo(cx,cy); rCtx.lineTo(sx,sy);
+  rCtx.strokeStyle = "rgba(0,255,65,0.85)";
   rCtx.lineWidth = 2*dpr;
   rCtx.stroke();
+  // bright tip
+  rCtx.beginPath(); rCtx.arc(sx,sy,3*dpr,0,Math.PI*2);
+  rCtx.fillStyle = "#00ff41"; rCtx.fill();
 
-  // centre
-  rCtx.fillStyle = "#00ff41";
-  rCtx.beginPath();
-  rCtx.arc(cx,cy,3*dpr,0,Math.PI*2);
-  rCtx.fill();
+  // ── HUD corner brackets ──
+  var cb = 20*dpr, co = 8*dpr;
+  rCtx.strokeStyle = "rgba(0,255,65,0.3)";
+  rCtx.lineWidth = 2*dpr;
+  // top-left
+  rCtx.beginPath(); rCtx.moveTo(co,co+cb); rCtx.lineTo(co,co); rCtx.lineTo(co+cb,co); rCtx.stroke();
+  // top-right
+  rCtx.beginPath(); rCtx.moveTo(W-co-cb,co); rCtx.lineTo(W-co,co); rCtx.lineTo(W-co,co+cb); rCtx.stroke();
+  // bottom-left
+  rCtx.beginPath(); rCtx.moveTo(co,H-co-cb); rCtx.lineTo(co,H-co); rCtx.lineTo(co+cb,H-co); rCtx.stroke();
+  // bottom-right
+  rCtx.beginPath(); rCtx.moveTo(W-co-cb,H-co); rCtx.lineTo(W-co,H-co); rCtx.lineTo(W-co,H-co-cb); rCtx.stroke();
+
+  // ── centre marker with pulsing ring ──
+  var cPulse = 1 + 0.15*Math.sin(ts/500);
+  rCtx.beginPath(); rCtx.arc(cx,cy,8*dpr*cPulse,0,Math.PI*2);
+  rCtx.strokeStyle = "rgba(0,255,65,0.3)";
+  rCtx.lineWidth = 1*dpr; rCtx.stroke();
+  rCtx.beginPath(); rCtx.arc(cx,cy,3*dpr,0,Math.PI*2);
+  rCtx.fillStyle = "#00ff41"; rCtx.fill();
   rCtx.font = "bold "+(10*dpr)+"px monospace";
-  rCtx.fillText("YOU",cx+6*dpr,cy+4*dpr);
+  rCtx.fillStyle = "#00ff41";
+  rCtx.fillText("YOU",cx+10*dpr,cy+4*dpr);
 
-  // device dots
+  // ── ping ripples (expand outward when new device detected) ──
   var now = Date.now();
+  for(var pi=pingRipples.length-1; pi>=0; pi--){
+    var p = pingRipples[pi];
+    var age = now - p.born;
+    if(age > 1200){ pingRipples.splice(pi,1); continue; }
+    var progress = age/1200;
+    var pr = p.r + (p.maxR - p.r)*progress;
+    var pa = (1-progress)*0.4;
+    rCtx.beginPath(); rCtx.arc(p.cx,p.cy,pr,0,Math.PI*2);
+    rCtx.strokeStyle = hexToRgba(p.color, pa);
+    rCtx.lineWidth = 2*dpr; rCtx.stroke();
+  }
+
+  // ── device dots ──
   var addrs = Object.keys(devices);
   for(var i=0;i<addrs.length;i++){
     var dev = devices[addrs[i]];
@@ -348,47 +531,71 @@ function drawRadar(ts){
     var r2 = distToRadius(dist, maxR);
     var dx = cx + Math.cos(angle)*r2;
     var dy = cy + Math.sin(angle)*r2;
-    dev._rx = dx; dev._ry = dy; // store for hit-test
+    dev._rx = dx; dev._ry = dy;
 
     var col = dotColor(dist);
     var baseSize = 4*dpr;
-    // pulse on recent update (last 1.5s)
-    var age = now - (dev._updateTs||0);
-    var pulse = age < 1500 ? 1 + 0.6*(1 - age/1500) : 1;
-    // highlight on hover
+    var age2 = now - (dev._updateTs||0);
+    var pulse = age2 < 1500 ? 1 + 0.6*(1 - age2/1500) : 1;
     if(hoveredAddr === dev.address) pulse = Math.max(pulse, 1.6);
     var sz = baseSize * pulse;
 
-    // glow
-    rCtx.beginPath();
-    rCtx.arc(dx,dy,sz+3*dpr,0,Math.PI*2);
-    rCtx.fillStyle = col.replace(")", ",0.15)").replace("rgb","rgba");
-    if(col.charAt(0)==="#"){
-      var gc = hexToRgba(col,0.15);
-      rCtx.fillStyle = gc;
-    }
-    rCtx.fill();
+    // outer glow ring
+    rCtx.beginPath(); rCtx.arc(dx,dy,sz+6*dpr,0,Math.PI*2);
+    rCtx.fillStyle = hexToRgba(col,0.06); rCtx.fill();
+    // inner glow
+    rCtx.beginPath(); rCtx.arc(dx,dy,sz+3*dpr,0,Math.PI*2);
+    rCtx.fillStyle = hexToRgba(col,0.15); rCtx.fill();
+    // core dot
+    rCtx.beginPath(); rCtx.arc(dx,dy,sz,0,Math.PI*2);
+    rCtx.fillStyle = col; rCtx.fill();
+    // bright center
+    rCtx.beginPath(); rCtx.arc(dx,dy,sz*0.4,0,Math.PI*2);
+    rCtx.fillStyle = hexToRgba("#ffffff",0.5); rCtx.fill();
 
-    rCtx.beginPath();
-    rCtx.arc(dx,dy,sz,0,Math.PI*2);
-    rCtx.fillStyle = col;
-    rCtx.fill();
+    // connecting line from center to dot (very faint)
+    rCtx.beginPath(); rCtx.moveTo(cx,cy); rCtx.lineTo(dx,dy);
+    rCtx.strokeStyle = hexToRgba(col,0.07);
+    rCtx.lineWidth = 1*dpr; rCtx.stroke();
 
-    // label near dot
+    // label
     if(pulse > 1.3 || hoveredAddr === dev.address){
       rCtx.fillStyle = "#e0e0e0";
       rCtx.font = (9*dpr)+"px monospace";
       var lbl = dev.name && dev.name !== "Unknown" ? dev.name.substring(0,14) : dev.address.substring(0,8);
-      rCtx.fillText(lbl, dx+sz+4*dpr, dy+3*dpr);
+      rCtx.fillText(lbl, dx+sz+6*dpr, dy+3*dpr);
+      // show distance under label
+      if(dist!=null && dist!==""){
+        rCtx.fillStyle = hexToRgba(col,0.7);
+        rCtx.font = (8*dpr)+"px monospace";
+        rCtx.fillText("~"+Number(dist).toFixed(1)+"m", dx+sz+6*dpr, dy+14*dpr);
+      }
     }
   }
+
+  // ── HUD readouts in corners ──
+  var devCount = Object.keys(devices).length;
+  rCtx.fillStyle = "rgba(0,255,65,0.35)";
+  rCtx.font = (9*dpr)+"px monospace";
+  rCtx.fillText("DEVICES: "+devCount, co+4*dpr, co+cb+14*dpr);
+  rCtx.fillText("RANGE: "+MAX_RING+"m", W-co-70*dpr, co+cb+14*dpr);
 
   requestAnimationFrame(drawRadar);
 }
 
-function hexToRgba(hex, a){
-  var r=parseInt(hex.slice(1,3),16), g=parseInt(hex.slice(3,5),16), b=parseInt(hex.slice(5,7),16);
-  return "rgba("+r+","+g+","+b+","+a+")";
+// spawn a ping ripple when a new device is detected or updated
+function spawnPing(dev, cx, cy, maxR){
+  var angle = (hashAddr(dev.address)%3600)/3600*Math.PI*2;
+  var dist = dev.est_distance;
+  var r2 = distToRadius(dist, maxR);
+  var dpr = window.devicePixelRatio||1;
+  pingRipples.push({
+    cx: cx + Math.cos(angle)*r2,
+    cy: cy + Math.sin(angle)*r2,
+    r: 4*dpr, maxR: 25*dpr,
+    color: dotColor(dist),
+    born: Date.now()
+  });
 }
 
 requestAnimationFrame(drawRadar);
@@ -649,10 +856,19 @@ socket.on("connect", function(){
 });
 
 socket.on("device_update", function(d){
+  var isNew = !devices[d.address];
   d._updateTs = Date.now();
   devices[d.address] = d;
   updateDevMarker(d);
   updateTable();
+  // spawn a ping ripple for new devices
+  if(isNew){
+    var dpr = window.devicePixelRatio||1;
+    var W = rCanvas.width, H = rCanvas.height;
+    var cxr = W/2, cyr = H/2;
+    var maxRr = Math.min(cxr,cyr)*0.9;
+    spawnPing(d, cxr, cyr, maxRr);
+  }
 });
 
 socket.on("gps_update", function(g){
