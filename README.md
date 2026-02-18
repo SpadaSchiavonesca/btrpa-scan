@@ -1,6 +1,6 @@
 # btrpa-scan (GRC Enhancement)
 [![Python 3.x](https://img.shields.io/badge/python-3.x-blue.svg)](https://www.python.org/)
-[![NIST Compliance](https://img.shields.io/badge/Compliance-NIST%20SP%20800--121-green.svg)](https://csrc.nist.gov/pubs/sp/800/121/r2/final)
+[![NIST Compliance](https://img.shields.io/badge/Compliance-NIST%20SP%20800--121-green.svg)](https://csrc.nist.gov/pubs/sp/800/121/r2/upd1/final)
 [![Security Audit](https://img.shields.io/badge/Security-BLE%20Audit-red.svg)](#)
 [![Forked From](https://img.shields.io/badge/Forked%20From-hackingdave%2Fbtrpa--scan-orange)](https://github.com/hackingdave/btrpa-scan)
 
