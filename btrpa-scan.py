@@ -116,7 +116,7 @@ _GUI_HTML = r"""<!DOCTYPE html>
 }
 html,body{height:100%;background:var(--bg);color:var(--text);
   font-family:'Fira Code',Consolas,'Courier New',monospace;font-size:13px;
-  overflow-x:hidden;position:relative}
+  overflow:hidden;position:relative;display:flex;flex-direction:column}
 
 /* ── matrix data rain background ─────────────────────────── */
 #matrix-bg{position:fixed;inset:0;z-index:0;pointer-events:none;overflow:hidden}
@@ -134,7 +134,7 @@ a{color:var(--cyan)}
 #header .meta{font-size:11px;color:var(--dim);width:100%}
 
 /* ── main panels ───────────────────────────────────────────── */
-#panels{display:flex;height:calc(100vh - 50px);min-height:300px}
+#panels{display:flex;flex:1;min-height:0}
 #radar-wrap{flex:3;position:relative;background:var(--card);
   border-right:1px solid var(--border);min-width:0}
 #radar-canvas{width:100%;height:100%;display:block}
@@ -294,11 +294,14 @@ function resizeMatrix(){
   mCanvas.width  = window.innerWidth;
   mCanvas.height = window.innerHeight;
   matrixW = Math.floor(mCanvas.width / MATRIX_FONT_SIZE);
-  // preserve existing columns, add new ones if wider
   while(matrixCols.length < matrixW) matrixCols.push(Math.random()*mCanvas.height);
   while(matrixData.length < matrixW) matrixData.push([]);
   matrixCols.length = matrixW;
   matrixData.length = matrixW;
+  // clamp existing column Y-positions to new height
+  for(var i=0;i<matrixW;i++){
+    if(matrixCols[i]>mCanvas.height) matrixCols[i]=Math.random()*mCanvas.height;
+  }
 }
 window.addEventListener("resize", resizeMatrix);
 resizeMatrix();
@@ -311,22 +314,18 @@ var matrixPool = [
 ];
 
 function feedMatrixPool(){
-  if(matrixPool.length > 200) return; // cap pool size
+  // rebuild pool from current devices (replaces stale entries)
+  var seen = new Set(matrixPool.slice(0,21)); // keep base BLE terms
+  var fresh = matrixPool.slice(0,21); // base pool
   var addrs = Object.keys(devices);
-  for(var i=0;i<addrs.length;i++){
+  for(var i=0;i<addrs.length&&fresh.length<200;i++){
     var d = devices[addrs[i]];
-    if(matrixPool.indexOf(d.address)===-1) matrixPool.push(d.address);
-    if(d.rssi!=null){
-      var rStr = "RSSI:"+d.rssi;
-      if(matrixPool.indexOf(rStr)===-1) matrixPool.push(rStr);
-    }
-    if(d.name && d.name!=="Unknown" && matrixPool.indexOf(d.name)===-1){
-      matrixPool.push(d.name);
-    }
-    if(d.manufacturer_data && matrixPool.indexOf(d.manufacturer_data)===-1){
-      matrixPool.push(d.manufacturer_data.substring(0,16));
-    }
+    if(!seen.has(d.address)){seen.add(d.address);fresh.push(d.address);}
+    if(d.rssi!=null){var rStr="RSSI:"+d.rssi;if(!seen.has(rStr)){seen.add(rStr);fresh.push(rStr);}}
+    if(d.name&&d.name!=="Unknown"&&!seen.has(d.name)){seen.add(d.name);fresh.push(d.name);}
+    if(d.manufacturer_data){var mf=d.manufacturer_data.substring(0,16);if(!seen.has(mf)){seen.add(mf);fresh.push(mf);}}
   }
+  matrixPool = fresh;
 }
 
 function getMatrixChar(col){
@@ -339,10 +338,17 @@ function getMatrixChar(col){
   return "0123456789ABCDEF"[Math.floor(Math.random()*16)];
 }
 
+var matrixFrameCount = 0;
 function drawMatrix(){
-  // darken previous frame
-  mCtx.fillStyle = "rgba(10,10,10,0.06)";
-  mCtx.fillRect(0,0,mCanvas.width,mCanvas.height);
+  matrixFrameCount++;
+  // full clear every ~30s (600 frames at 20fps) to prevent green haze buildup
+  if(matrixFrameCount % 600 === 0){
+    mCtx.fillStyle = "#0a0a0a";
+    mCtx.fillRect(0,0,mCanvas.width,mCanvas.height);
+  } else {
+    mCtx.fillStyle = "rgba(10,10,10,0.08)";
+    mCtx.fillRect(0,0,mCanvas.width,mCanvas.height);
+  }
   mCtx.font = MATRIX_FONT_SIZE+"px monospace";
   for(var i=0;i<matrixW;i++){
     var x = i * MATRIX_FONT_SIZE;
@@ -381,8 +387,12 @@ var pingRipples = []; // {cx,cy,r,maxR,alpha,color,born}
 
 function resizeCanvas(){
   var wrap = document.getElementById("radar-wrap");
-  rCanvas.width  = wrap.clientWidth  * (window.devicePixelRatio||1);
-  rCanvas.height = wrap.clientHeight * (window.devicePixelRatio||1);
+  var dpr = window.devicePixelRatio||1;
+  var newW = Math.floor(wrap.clientWidth * dpr);
+  var newH = Math.floor(wrap.clientHeight * dpr);
+  if(rCanvas.width === newW && rCanvas.height === newH) return;
+  rCanvas.width  = newW;
+  rCanvas.height = newH;
   rCanvas.style.width  = wrap.clientWidth  + "px";
   rCanvas.style.height = wrap.clientHeight + "px";
 }
@@ -392,7 +402,13 @@ resizeCanvas();
 function hashAddr(addr){
   var h=0;
   for(var i=0;i<addr.length;i++){h=((h<<5)-h)+addr.charCodeAt(i);h|=0;}
-  return Math.abs(h);
+  return h<0?-h:h;
+}
+// secondary hash for radius jitter to separate dots at same angle
+function hashAddr2(addr){
+  var h=5381;
+  for(var i=0;i<addr.length;i++){h=((h<<5)+h)^addr.charCodeAt(i);h|=0;}
+  return h<0?-h:h;
 }
 
 function distToRadius(d, maxR){
@@ -431,7 +447,7 @@ function spawnGhost(W, H, dpr){
     if(dev.name && dev.name !== "Unknown") options.push(dev.name);
     if(dev.rssi != null) options.push("RSSI:" + dev.rssi + "dBm");
     if(dev.manufacturer_data) options.push(dev.manufacturer_data.substring(0,20));
-    if(dev.est_distance != null && dev.est_distance !== "") options.push("~" + Number(dev.est_distance).toFixed(1) + "m");
+    if(dev.est_distance != null && dev.est_distance !== "" && !isNaN(dev.est_distance)) options.push("~" + Number(dev.est_distance).toFixed(1) + "m");
     if(dev.service_uuids) options.push(dev.service_uuids.substring(0,22));
     text = options[Math.floor(Math.random()*options.length)];
   } else {
@@ -479,14 +495,15 @@ function drawGhosts(W, H, dpr){
     if(progress < 0.15) envelope = progress / 0.15;
     else if(progress > 0.80) envelope = (1 - progress) / 0.20;
     else envelope = 1;
-    // flicker: random on/off toggling
+    // flicker: time-based on/off toggling (frame-rate independent)
     var flickerOn = Math.sin(age / g.flickerRate * Math.PI) > -0.3;
+    var flickerCycle = Math.floor(age / g.flickerRate);
     if(!flickerOn && progress > 0.15 && progress < 0.80){
-      // occasional hard flicker off
-      if(Math.random() < 0.08) continue;
+      // occasional hard flicker off (deterministic per cycle)
+      if((flickerCycle * 7 + g.born) % 13 === 0) continue;
     }
-    // occasional glitch: brief full-brightness flash
-    var glitch = Math.random() < 0.006;
+    // occasional glitch: time-based flash (every ~3s per ghost, not random per frame)
+    var glitch = (age % 3000) < 50;
     var alpha = glitch ? 0.18 : Math.max(0, envelope * 0.09 * (flickerOn ? 1 : 0.2));
     if(alpha < 0.005) continue;
 
@@ -658,6 +675,9 @@ function drawRadar(ts){
     var angle = (hashAddr(dev.address)%3600)/3600*Math.PI*2;
     var dist = dev.est_distance;
     var r2 = distToRadius(dist, maxR);
+    // small radius jitter to separate colliding dots
+    var jitter = ((hashAddr2(dev.address)%100)-50)/50 * 8 * dpr;
+    r2 = Math.max(4*dpr, Math.min(r2 + jitter, maxR));
     var dx = cx + Math.cos(angle)*r2;
     var dy = cy + Math.sin(angle)*r2;
     dev._rx = dx; dev._ry = dy;
@@ -797,7 +817,7 @@ function updateDevMarker(dev){
   } else {
     var m = L.circleMarker(ll,{radius:6,color:col,fillColor:col,
       fillOpacity:0.8,weight:1}).addTo(map);
-    m.bindPopup("<b>"+(dev.name||"Unknown")+"</b><br>"+dev.address);
+    m.bindPopup("<b>"+esc(dev.name||"Unknown")+"</b><br>"+esc(dev.address));
     devMarkers[dev.address] = m;
   }
 }
@@ -816,6 +836,9 @@ function showMap(){
    ================================================================ */
 var dlScroll = document.getElementById("dl-scroll");
 var dlEntries = {}; // address -> DOM element
+var STALE_TIMEOUT = 600000; // 10 minutes — prune devices not seen for this long
+var dlPendingUpdate = false;
+var dlLastOrder = ""; // track sort order to avoid unnecessary reorder
 
 function sigClass(d){
   var dist = d.est_distance;
@@ -825,14 +848,47 @@ function sigClass(d){
   return "sig-far";
 }
 
+// prune stale devices not seen for STALE_TIMEOUT
+function pruneStaleDevices(){
+  var now = Date.now();
+  var addrs = Object.keys(devices);
+  for(var i=0;i<addrs.length;i++){
+    var addr = addrs[i];
+    var d = devices[addr];
+    if(now - (d._updateTs||0) > STALE_TIMEOUT && !pinnedAddrs[addr]){
+      delete devices[addr];
+      // remove DOM entry
+      if(dlEntries[addr]){
+        if(dlEntries[addr].parentNode) dlEntries[addr].parentNode.removeChild(dlEntries[addr]);
+        delete dlEntries[addr];
+      }
+      // remove map marker
+      if(devMarkers[addr]){
+        if(map) map.removeLayer(devMarkers[addr]);
+        delete devMarkers[addr];
+      }
+    }
+  }
+}
+// run prune every 30s
+setInterval(function(){ pruneStaleDevices(); updateDeviceListNow(); }, 30000);
+
 function updateDeviceList(){
+  // throttle: batch updates, run at most once per 500ms
+  if(dlPendingUpdate) return;
+  dlPendingUpdate = true;
+  setTimeout(function(){ dlPendingUpdate=false; updateDeviceListNow(); }, 500);
+}
+
+function updateDeviceListNow(){
   var list = Object.values(devices);
-  // sort by RSSI descending (strongest first)
   list.sort(function(a,b){
     var va = a.rssi!=null ? a.rssi : -999;
     var vb = b.rssi!=null ? b.rssi : -999;
     return vb - va;
   });
+  // build new order key to check if reorder is needed
+  var orderKey = "";
   for(var i=0;i<list.length;i++){
     var d = list[i];
     var el = dlEntries[d.address];
@@ -857,25 +913,26 @@ function updateDeviceList(){
       });
       dlEntries[d.address] = el;
     }
-    // update content
     el.querySelector(".de-addr").textContent = d.address;
     el.querySelector(".de-name").textContent = d.name&&d.name!=="Unknown" ? d.name : "";
     var rssiEl = el.querySelector(".de-rssi");
     rssiEl.textContent = d.rssi!=null ? d.rssi+" dBm" : "";
     rssiEl.style.color = dotColor(d.est_distance);
-    var distStr = (d.est_distance!=null&&d.est_distance!=="") ? "~"+Number(d.est_distance).toFixed(1)+"m" : "";
+    var distVal = d.est_distance;
+    var distStr = (distVal!=null&&distVal!==""&&!isNaN(distVal)) ? "~"+Number(distVal).toFixed(1)+"m" : "";
     el.querySelector(".de-dist").textContent = distStr;
     el.querySelector(".de-pin").textContent = pinnedAddrs[d.address] ? " [pinned]" : "";
-    // update signal class
     el.className = "dev-entry " + sigClass(d) + (pinnedAddrs[d.address] ? " pinned" : "");
-    // ensure in DOM
     if(!el.parentNode) dlScroll.appendChild(el);
+    orderKey += d.address + ",";
   }
-  // reorder
-  for(var j=0;j<list.length;j++){
-    dlScroll.appendChild(dlEntries[list[j].address]);
+  // only reorder DOM if sort order changed
+  if(orderKey !== dlLastOrder){
+    dlLastOrder = orderKey;
+    for(var j=0;j<list.length;j++){
+      dlScroll.appendChild(dlEntries[list[j].address]);
+    }
   }
-  // update header count
   document.querySelector("#device-list .dl-header").textContent = "Detected ("+list.length+")";
 }
 
@@ -886,64 +943,74 @@ function togglePin(addr){
   updatePinnedPanel();
 }
 
+var pinEntries = {}; // address -> DOM element cache
+var pinPanelVisible = false;
+
 function updatePinnedPanel(){
   var panel = document.getElementById("pinned-panel");
   var scroll = document.getElementById("pinned-scroll");
   var addrs = Object.keys(pinnedAddrs);
+  var wasVisible = pinPanelVisible;
   if(addrs.length === 0){
-    panel.classList.remove("visible");
-    resizeCanvas();
+    if(pinPanelVisible){
+      panel.classList.remove("visible");
+      pinPanelVisible = false;
+      // remove all cached pin entries
+      var old = Object.keys(pinEntries);
+      for(var oi=0;oi<old.length;oi++){
+        if(pinEntries[old[oi]].parentNode) scroll.removeChild(pinEntries[old[oi]]);
+        delete pinEntries[old[oi]];
+      }
+      resizeCanvas(); // only resize on visibility change
+    }
     return;
   }
-  panel.classList.add("visible");
-  // rebuild pinned entries
-  scroll.innerHTML = "";
+  if(!pinPanelVisible){
+    panel.classList.add("visible");
+    pinPanelVisible = true;
+  }
+  // remove entries that are no longer pinned
+  var oldPins = Object.keys(pinEntries);
+  for(var ri=0;ri<oldPins.length;ri++){
+    if(!pinnedAddrs[oldPins[ri]]){
+      if(pinEntries[oldPins[ri]].parentNode) scroll.removeChild(pinEntries[oldPins[ri]]);
+      delete pinEntries[oldPins[ri]];
+    }
+  }
+  // create or update entries
   for(var i=0;i<addrs.length;i++){
     var addr = addrs[i];
     var d = devices[addr];
-    var el = document.createElement("div");
-    el.className = "pin-entry";
-    if(d) el.style.borderLeftColor = dotColor(d.est_distance);
-    var info = document.createElement("div");
-    var addrEl = document.createElement("div");
-    addrEl.className = "pe-addr";
-    addrEl.textContent = addr;
-    info.appendChild(addrEl);
-    if(d){
-      if(d.name && d.name !== "Unknown"){
-        var nameEl = document.createElement("div");
-        nameEl.className = "pe-name";
-        nameEl.textContent = d.name;
-        info.appendChild(nameEl);
-      }
-      var metaEl = document.createElement("div");
-      metaEl.className = "pe-meta";
-      var parts = [];
-      if(d.rssi!=null) parts.push(d.rssi+" dBm");
-      if(d.est_distance!=null&&d.est_distance!=="") parts.push("~"+Number(d.est_distance).toFixed(1)+"m");
-      metaEl.textContent = parts.join(" | ");
-      info.appendChild(metaEl);
+    var el = pinEntries[addr];
+    if(!el){
+      el = document.createElement("div");
+      el.className = "pin-entry";
+      el.innerHTML = '<div><div class="pe-addr"></div><div class="pe-name"></div><div class="pe-meta"></div></div><span class="pe-close">\u00D7</span>';
+      el.querySelector(".pe-close").addEventListener("click", (function(a){
+        return function(e){ e.stopPropagation(); togglePin(a); };
+      })(addr));
+      el.addEventListener("mouseenter", (function(a){
+        return function(e){ hoveredAddr=a; var dd=devices[a]; if(dd) showTooltip(dd,e.clientX,e.clientY); };
+      })(addr));
+      el.addEventListener("mousemove", function(e){
+        positionTooltip(document.getElementById("tooltip"),e.clientX,e.clientY);
+      });
+      el.addEventListener("mouseleave", function(){ hoveredAddr=null; hideTooltip(); });
+      pinEntries[addr] = el;
+      scroll.appendChild(el);
     }
-    el.appendChild(info);
-    var closeBtn = document.createElement("span");
-    closeBtn.className = "pe-close";
-    closeBtn.textContent = "\u00D7";
-    closeBtn.addEventListener("click", (function(a){
-      return function(e){ e.stopPropagation(); togglePin(a); };
-    })(addr));
-    el.appendChild(closeBtn);
-    // hover tooltip
-    el.addEventListener("mouseenter", (function(a){
-      return function(e){ hoveredAddr=a; var dd=devices[a]; if(dd) showTooltip(dd,e.clientX,e.clientY); };
-    })(addr));
-    el.addEventListener("mousemove", function(e){
-      positionTooltip(document.getElementById("tooltip"),e.clientX,e.clientY);
-    });
-    el.addEventListener("mouseleave", function(){ hoveredAddr=null; hideTooltip(); });
-    scroll.appendChild(el);
+    // update content
+    el.querySelector(".pe-addr").textContent = addr;
+    el.querySelector(".pe-name").textContent = (d&&d.name&&d.name!=="Unknown") ? d.name : "";
+    var parts = [];
+    if(d&&d.rssi!=null) parts.push(d.rssi+" dBm");
+    if(d&&d.est_distance!=null&&d.est_distance!==""&&!isNaN(d.est_distance)) parts.push("~"+Number(d.est_distance).toFixed(1)+"m");
+    el.querySelector(".pe-meta").textContent = parts.join(" | ");
+    el.style.borderLeftColor = d ? dotColor(d.est_distance) : "";
   }
   document.querySelector("#pinned-panel .pp-header").textContent = "Pinned ("+addrs.length+")";
-  resizeCanvas();
+  // only resize on visibility change
+  if(!wasVisible && pinPanelVisible) resizeCanvas();
 }
 
 /* ================================================================
@@ -955,7 +1022,7 @@ function showTooltip(dev, x, y){
   html += '<span class="lbl">Address:</span> <span class="val">'+esc(dev.address)+'</span><br>';
   html += '<span class="lbl">Name:</span> <span class="val">'+esc(dev.name||"Unknown")+'</span><br>';
   html += '<span class="lbl">RSSI:</span> <span class="val">'+(dev.rssi!=null?dev.rssi+" dBm":"N/A");
-  if(dev.avg_rssi!=null) html += ' (avg: '+dev.avg_rssi+' dBm)';
+  if(dev.avg_rssi!=null) html += ' (avg: '+esc(String(dev.avg_rssi))+' dBm)';
   html += '</span><br>';
   html += '<span class="lbl">TX Power:</span> <span class="val">'+(dev.tx_power!=null?dev.tx_power+' dBm':'N/A')+'</span><br>';
   html += '<span class="lbl">Distance:</span> <span class="val">'+((dev.est_distance!=null&&dev.est_distance!=="")?"~"+Number(dev.est_distance).toFixed(1)+" m":"Unknown")+'</span><br>';
@@ -1021,11 +1088,11 @@ function showOverlay(data){
 /* ================================================================
    Socket.IO
    ================================================================ */
-var socket = io("http://"+window.location.hostname+":"+WSPORT, {transports:["websocket","polling"]});
+var socket = io(window.location.protocol+"//"+window.location.hostname+":"+WSPORT, {transports:["websocket","polling"]});
 
 socket.on("connect", function(){
   // fetch full state on connect
-  fetch("http://"+window.location.hostname+":"+WSPORT+"/api/state").then(function(r){return r.json();}).then(function(state){
+  fetch(window.location.protocol+"//"+window.location.hostname+":"+WSPORT+"/api/state").then(function(r){return r.json();}).then(function(state){
     if(state.devices){
       var addrs = Object.keys(state.devices);
       for(var i=0;i<addrs.length;i++){
@@ -1037,6 +1104,11 @@ socket.on("connect", function(){
       updateDeviceList();
     }
     if(state.status) updateStatus(state.status);
+    if(state.completed){
+      updateStatus({scanning:false, elapsed:state.completed.elapsed,
+        total_detections:state.completed.total_detections, unique_count:state.completed.unique_devices});
+      showOverlay(state.completed);
+    }
     if(state.gps && state.gps.lat!=null){
       hasGPS = true;
       scannerGPS = state.gps;
@@ -1112,6 +1184,7 @@ class GpsdReader:
         self._connected = False
         self._running = False
         self._thread: Optional[threading.Thread] = None
+        self._sock: Optional[socket.socket] = None
 
     @property
     def fix(self) -> Optional[dict]:
@@ -1130,6 +1203,13 @@ class GpsdReader:
 
     def stop(self):
         self._running = False
+        # Close socket to unblock recv() immediately
+        with self._lock:
+            if self._sock is not None:
+                try:
+                    self._sock.close()
+                except OSError:
+                    pass
         if self._thread is not None:
             self._thread.join(timeout=2)
 
@@ -1147,6 +1227,8 @@ class GpsdReader:
     def _connect_and_read(self):
         sock = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
         sock.settimeout(_GPS_SOCKET_TIMEOUT)
+        with self._lock:
+            self._sock = sock
         try:
             sock.connect((self._host, self._port))
             with self._lock:
@@ -1181,7 +1263,12 @@ class GpsdReader:
                                     "alt": msg.get("alt"),
                                 }
         finally:
+            with self._lock:
+                self._sock = None
             sock.close()
+
+
+_GUI_MAX_DEVICES = 1000  # server-side device cache cap
 
 
 class GuiServer:
@@ -1197,9 +1284,12 @@ class GuiServer:
         self._app.config['SECRET_KEY'] = os.urandom(24).hex()
         self._sio = SocketIO(self._app, async_mode='threading', cors_allowed_origins='*')
         self._thread = None
-        self._devices = {}
-        self._scan_status = {}
-        self._gps_fix = None
+        self._lock = threading.Lock()
+        self._devices: Dict[str, dict] = {}
+        self._device_ts: Dict[str, float] = {}  # address -> last update time
+        self._scan_status: dict = {}
+        self._gps_fix: Optional[dict] = None
+        self._completed: Optional[dict] = None
         self._setup_routes()
 
     def _setup_routes(self):
@@ -1209,39 +1299,52 @@ class GuiServer:
 
         @self._app.route('/api/state')
         def state():
+            with self._lock:
+                devices_copy = json.loads(json.dumps(self._devices))
+                status_copy = dict(self._scan_status) if self._scan_status else {}
+                gps_copy = dict(self._gps_fix) if self._gps_fix else None
+                completed_copy = dict(self._completed) if self._completed else None
             return jsonify({
-                'devices': dict(self._devices),
-                'status': dict(self._scan_status) if self._scan_status else {},
-                'gps': self._gps_fix,
+                'devices': devices_copy,
+                'status': status_copy,
+                'gps': gps_copy,
+                'completed': completed_copy,
             })
 
     def start(self):
         """Start the Flask server in a background thread."""
-        started = threading.Event()
-        actual_port = [self._port]
+        ready = threading.Event()
+        result = {'port': -1}
 
         def _serve():
             for p in range(self._port, self._port + 11):
+                # probe the port before committing
+                probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
                 try:
-                    actual_port[0] = p
-                    started.set()
+                    probe.bind(('0.0.0.0', p))
+                    probe.close()
+                except OSError:
+                    probe.close()
+                    continue
+                # port is available — start server
+                result['port'] = p
+                ready.set()
+                try:
                     self._sio.run(self._app, host='0.0.0.0', port=p,
                                   allow_unsafe_werkzeug=True,
                                   log_output=False)
-                    return
                 except OSError:
-                    started.clear()
-                    continue
-            actual_port[0] = -1
-            started.set()
+                    pass
+                return
+            result['port'] = -1
+            ready.set()
 
         self._thread = threading.Thread(target=_serve, daemon=True)
         self._thread.start()
 
-        # Wait for server to bind (or all ports to fail)
-        started.wait(timeout=5)
-        time.sleep(0.3)  # small extra delay for server to be ready
-        self._port = actual_port[0]
+        ready.wait(timeout=5)
+        time.sleep(0.3)
+        self._port = result['port']
         if self._port == -1:
             print("Error: Could not find open port for GUI server")
             sys.exit(1)
@@ -1253,23 +1356,48 @@ class GuiServer:
         except Exception:
             print(f"  Could not open browser — navigate to {url}")
 
+    def stop(self):
+        """Signal the SocketIO server to shut down."""
+        try:
+            self._sio.stop()
+        except Exception:
+            pass
+
+    def _evict_old_devices(self):
+        """Remove oldest devices when cache exceeds cap."""
+        if len(self._devices) <= _GUI_MAX_DEVICES:
+            return
+        # evict oldest entries
+        sorted_addrs = sorted(self._device_ts, key=self._device_ts.get)
+        to_remove = len(self._devices) - _GUI_MAX_DEVICES
+        for addr in sorted_addrs[:to_remove]:
+            del self._devices[addr]
+            del self._device_ts[addr]
+
     def emit_device(self, data: dict):
         """Push a device update to all connected clients."""
-        self._devices[data['address']] = data
+        with self._lock:
+            self._devices[data['address']] = data
+            self._device_ts[data['address']] = time.time()
+            self._evict_old_devices()
         self._sio.emit('device_update', data)
 
     def emit_gps(self, fix: dict):
         """Push scanner GPS position to all connected clients."""
-        self._gps_fix = fix
+        with self._lock:
+            self._gps_fix = fix
         self._sio.emit('gps_update', fix)
 
     def emit_status(self, status: dict):
         """Push scan status to all connected clients."""
-        self._scan_status = status
+        with self._lock:
+            self._scan_status = status
         self._sio.emit('scan_status', status)
 
     def emit_complete(self, summary: dict):
-        """Push scan complete event."""
+        """Push scan complete event and store for reconnecting clients."""
+        with self._lock:
+            self._completed = summary
         self._sio.emit('scan_complete', summary)
 
 
@@ -1769,9 +1897,31 @@ class BLEScanner:
                 'unique_devices': len(self.unique_devices),
             })
 
+        # Stop GUI server
+        if self._gui_server is not None:
+            self._gui_server.stop()
+
         # Summary and output (printed after TUI is torn down)
-        self._print_summary(elapsed)
+        if not self.gui:
+            self._print_summary(elapsed)
         self._write_output()
+
+    def _poll_tick(self, start: float):
+        """One tick of the scan loop: redraw TUI, emit GUI status/GPS."""
+        if self._tui_screen is not None:
+            self._redraw_tui(self._tui_screen)
+        if self.gui and self._gui_server is not None:
+            el = time.time() - start
+            self._gui_server.emit_status({
+                'elapsed': round(el, 1),
+                'total_detections': self.seen_count,
+                'unique_count': len(self.unique_devices),
+                'scanning': True,
+            })
+            if self._gps is not None:
+                fix = self._gps.fix
+                if fix is not None:
+                    self._gui_server.emit_gps(fix)
 
     async def _scan_loop(self) -> float:
         """Run the BLE scanner and return elapsed seconds."""
@@ -1804,39 +1954,13 @@ class BLEScanner:
         try:
             if self.timeout == float('inf'):
                 while self.running:
-                    if self._tui_screen is not None:
-                        self._redraw_tui(self._tui_screen)
-                    if self.gui and self._gui_server is not None:
-                        el = time.time() - start
-                        self._gui_server.emit_status({
-                            'elapsed': round(el, 1),
-                            'total_detections': self.seen_count,
-                            'unique_count': len(self.unique_devices),
-                            'scanning': True,
-                        })
-                        if self._gps is not None:
-                            fix = self._gps.fix
-                            if fix is not None:
-                                self._gui_server.emit_gps(fix)
+                    self._poll_tick(start)
                     await asyncio.sleep(
                         _TUI_REFRESH_INTERVAL if self.tui
                         else _SCAN_POLL_INTERVAL)
             else:
                 while self.running and (time.time() - start) < self.timeout:
-                    if self._tui_screen is not None:
-                        self._redraw_tui(self._tui_screen)
-                    if self.gui and self._gui_server is not None:
-                        el = time.time() - start
-                        self._gui_server.emit_status({
-                            'elapsed': round(el, 1),
-                            'total_detections': self.seen_count,
-                            'unique_count': len(self.unique_devices),
-                            'scanning': True,
-                        })
-                        if self._gps is not None:
-                            fix = self._gps.fix
-                            if fix is not None:
-                                self._gui_server.emit_gps(fix)
+                    self._poll_tick(start)
                     await asyncio.sleep(_TIMED_SCAN_POLL_INTERVAL)
         except asyncio.CancelledError:
             pass
@@ -2331,15 +2455,12 @@ def main():
         gui_port=args.gui_port,
     )
 
-    # On Windows, asyncio doesn't support loop.add_signal_handler, so
-    # fall back to the older signal.signal approach.
-    if platform.system() == "Windows":
-        signal.signal(signal.SIGINT, lambda *_: scanner.stop())
-
     try:
         asyncio.run(scanner.scan())
     except KeyboardInterrupt:
-        pass
+        # Ensure stop() is called so cleanup (summary, output, GUI shutdown)
+        # runs properly — covers Windows where add_signal_handler is unavailable.
+        scanner.stop()
 
 
 if __name__ == "__main__":
